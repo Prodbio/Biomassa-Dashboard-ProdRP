@@ -9182,7 +9182,10 @@ body.gf-on .gf-bar{
             <input type="checkbox" id="laporanLampiranOn" onchange="toggleLaporanLampiran()">
             📎 Tambah halaman <b>Lampiran</b> — realisasi mitra per PLTU
           </label>
-          <button class="laporan-mini-btn" id="laporanLampiranResetBtn" style="display:none" onclick="renderLaporanLampiran(true)" title="Muat ulang daftar mitra dari Daftar Kontrak (isian manual akan hilang)">↻ Muat ulang dari Daftar Kontrak</button>
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <button class="laporan-mini-btn" id="laporanLampiranRestoreBtn" style="display:none" onclick="restoreLampiranRemoved()" title="Kembalikan mitra yang dihapus dari daftar lampiran (isian lain tetap)">↩ Kembalikan mitra dihapus</button>
+            <button class="laporan-mini-btn" id="laporanLampiranResetBtn" style="display:none" onclick="renderLaporanLampiran(true)" title="Muat ulang daftar mitra dari Daftar Kontrak (isian manual akan hilang)">↻ Muat ulang dari Daftar Kontrak</button>
+          </div>
         </div>
         <div class="lamp-body off" id="laporanLampiranBody">
           <div class="laporan-hint" id="laporanLampiranHint"></div>
@@ -13510,25 +13513,60 @@ function _lampRowHtml(pltu, r){
     ? '<td class="mitra"><input type="text" class="lamp-mitra-input" value="' + escapeHtml(r.mitra || '') +
       '" placeholder="Nama mitra…"></td>'
     : '<td class="mitra">' + escapeHtml(r.mitra || '—') + '</td>';
-  const act = manual
-    ? '<td class="act"><button type="button" class="lamp-row-del" onclick="removeLampiranMitra(this)" title="Hapus baris">✕</button></td>'
-    : '<td class="act"></td>';
+  // V127: baris dari Daftar Kontrak juga bisa dihapus — mitra bisa berhenti
+  // memasok walau masa kontraknya masih berjalan. Bedanya dengan baris manual:
+  // kuncinya dicatat di _lampRemovedKeys supaya tidak muncul lagi saat grid
+  // dibangun ulang dari Daftar Kontrak.
+  const act = '<td class="act"><button type="button" class="lamp-row-del" onclick="removeLampiranMitra(this)" title="' +
+    (manual ? 'Hapus baris' : 'Hapus mitra ini dari lampiran') + '">✕</button></td>';
   return tr + nameCell + _lampTextCell('jenis', r.jenis, 'mis. Sawdust') +
     _lampNumCell('vol', r.vol) + _lampNumCell('prev', r.prev) +
     _lampNumCell('real', r.real) + _lampNumCell('prognosa', r.prognosa) +
     _lampNumCell('do', r.do) + act + '</tr>';
 }
 
+// V127: kunci baris Daftar Kontrak yang sengaja dihapus user dari lampiran
+// (mitra sudah berhenti memasok padahal kontraknya masih berjalan). Disimpan
+// terpisah dari isian form karena grid dibangun ulang dari Daftar Kontrak tiap
+// kali wilayah/tanggal berubah — tanpa daftar ini barisnya akan muncul lagi.
+// Ikut tersimpan ke laporan sebagai `lampiran.removed`.
+let _lampRemovedKeys = [];
+let _lampHintBase = '';
+
+// Tulis ulang hint + tampilkan tombol "Kembalikan" bila ada baris yang dihapus.
+function _lampUpdateHint(){
+  const hint = document.getElementById('laporanLampiranHint');
+  const n = _lampRemovedKeys.length;
+  if (hint) hint.textContent = _lampHintBase +
+    (n ? ' · ' + n + ' mitra dihapus dari daftar' : '');
+  const btn = document.getElementById('laporanLampiranRestoreBtn');
+  const on = document.getElementById('laporanLampiranOn');
+  if (btn) btn.style.display = (n && on && on.checked) ? '' : 'none';
+}
+
+// Kembalikan semua baris kontrak yang dihapus; isian yang sedang diketik tetap
+// dipertahankan karena grid dibangun ulang dari DOM saat ini (force = false).
+function restoreLampiranRemoved(){
+  if (!_lampRemovedKeys.length) return;
+  _lampRemovedKeys = [];
+  renderLaporanLampiran(false);
+}
+window.restoreLampiranRemoved = restoreLampiranRemoved;
+
 // Bangun editor lampiran.
-//  force     — buang isian yang ada, tarik ulang dari Daftar Kontrak
-//  seedRows  — sumber nilai awal (dipakai saat memuat laporan tersimpan);
-//              bila kosong, nilai diambil dari DOM saat ini agar tidak hilang
-//              ketika grid dibangun ulang (mis. tanggal checkpoint diubah).
-function renderLaporanLampiran(force, seedRows){
+//  force       — buang isian yang ada, tarik ulang dari Daftar Kontrak
+//  seedRows    — sumber nilai awal (dipakai saat memuat laporan tersimpan);
+//                bila kosong, nilai diambil dari DOM saat ini agar tidak hilang
+//                ketika grid dibangun ulang (mis. tanggal checkpoint diubah).
+//  seedRemoved — daftar kunci mitra yang dihapus pada laporan tersimpan.
+function renderLaporanLampiran(force, seedRows, seedRemoved){
   const wrap = document.getElementById('laporanLampiranWrap');
   if (!wrap) return;
-  const hint = document.getElementById('laporanLampiranHint');
-  const setHint = (t) => { if (hint) hint.textContent = t; };
+  const setHint = (t) => { _lampHintBase = t; _lampUpdateHint(); };
+  // Daftar hapus di-reset saat "Muat ulang dari Daftar Kontrak"; saat memuat
+  // laporan tersimpan ia diganti dengan milik laporan itu.
+  if (seedRows) _lampRemovedKeys = (seedRemoved || []).slice();
+  else if (force) _lampRemovedKeys = [];
   const scope = _lampFormScope();
   if (!scope){
     wrap.innerHTML = '<div class="lamp-empty">Pilih wilayah &amp; tanggal checkpoint dulu.</div>';
@@ -13559,7 +13597,7 @@ function renderLaporanLampiran(force, seedRows){
     const pltu = p.name || '—';
     const cs = _lampActiveContracts(p, scope.year, scope.mi);
     const seenKey = {};
-    let rows = '';
+    let rows = '', nHidden = 0;
     cs.forEach(c => {
       const mitra = c.pemasok || '—';
       // Kunci per KONTRAK, bukan per nama mitra. doSigForContract() sudah memuat
@@ -13567,6 +13605,8 @@ function renderLaporanLampiran(force, seedRows){
       let key = (typeof doSigForContract === 'function' && doSigForContract(c)) || (pltu + '||' + mitra);
       seenKey[key] = (seenKey[key] || 0) + 1;
       if (seenKey[key] > 1) key += '#' + seenKey[key];
+      // V127: mitra yang dihapus user tidak dibangkitkan lagi.
+      if (_lampRemovedKeys.indexOf(key) >= 0){ nHidden++; return; }
       const saved = prevMap[key] || prevMap[pltu + '||' + mitra];
       const def = _lampContractDefaults(c, scope.year, scope.mi);
       const pick = (a, b) => (a === undefined || a === null) ? b : a;
@@ -13583,7 +13623,7 @@ function renderLaporanLampiran(force, seedRows){
         vol: r.vol, prev: r.prev, do: r.do, real: r.real, prognosa: r.prognosa, manual: true });
       nManual++;
     });
-    const cnt = cs.length + (manualByPltu[pltu] || []).length;
+    const cnt = cs.length - nHidden + (manualByPltu[pltu] || []).length;
     html += '<div class="lamp-pltu" data-lamp-pltu="' + escapeHtml(pltu) + '">' +
       '<div class="lamp-pltu-head"><div>' +
         '<div class="lamp-pltu-name">' + escapeHtml(pltu) + '</div>' +
@@ -13598,7 +13638,10 @@ function renderLaporanLampiran(force, seedRows){
           '<th>Realisasi ' + mName + ' (ton)</th><th>Prognosa ' + mName + ' (ton)</th>' +
           '<th class="do-h">DO ' + mName + ' (ton)</th><th class="act"></th>' +
         '</tr></thead><tbody>' +
-        (rows || '<tr><td class="mitra" colspan="8"><span style="color:var(--text-dim);font-size:11px">Tidak ada kontrak aktif di bulan ini — tambah manual bila perlu.</span></td></tr>') +
+        (rows || '<tr><td class="mitra" colspan="8"><span style="color:var(--text-dim);font-size:11px">' +
+          (nHidden ? 'Semua mitra PLTU ini dihapus dari lampiran.'
+                   : 'Tidak ada kontrak aktif di bulan ini — tambah manual bila perlu.') +
+          '</span></td></tr>') +
         '</tbody></table>' +
       '</div></div>';
   });
@@ -13641,8 +13684,20 @@ function removeLampiranMitra(btn){
   const tr = btn && btn.closest('tr');
   if (!tr) return;
   const box = tr.closest('.lamp-pltu');
+  // V127: baris dari Daftar Kontrak dicatat agar tidak lahir kembali saat grid
+  // dibangun ulang; baris manual cukup dibuang dari DOM.
+  if (tr.getAttribute('data-manual') !== '1'){
+    const key = tr.getAttribute('data-key') || '';
+    if (key && _lampRemovedKeys.indexOf(key) < 0) _lampRemovedKeys.push(key);
+  }
   tr.remove();
+  const tbody = box && box.querySelector('.lamp-table tbody');
+  if (tbody && !tbody.querySelector('tr[data-lamp-row]')){
+    tbody.innerHTML = '<tr><td class="mitra" colspan="8"><span style="color:var(--text-dim);font-size:11px">' +
+      'Semua mitra PLTU ini dihapus dari lampiran.</span></td></tr>';
+  }
   _lampSyncCount(box);
+  _lampUpdateHint();
 }
 window.removeLampiranMitra = removeLampiranMitra;
 
@@ -13654,6 +13709,7 @@ function toggleLaporanLampiran(){
   const resetBtn = document.getElementById('laporanLampiranResetBtn');
   if (body) body.classList.toggle('off', !on);
   if (resetBtn) resetBtn.style.display = on ? '' : 'none';
+  _lampUpdateHint();   // V127: tombol "Kembalikan" ikut sembunyi saat lampiran mati
   if (on && !document.querySelector('#laporanLampiranWrap .lamp-pltu')) renderLaporanLampiran(true);
 }
 window.toggleLaporanLampiran = toggleLaporanLampiran;
@@ -13667,7 +13723,9 @@ function buildLampiranFromForm(){
   if (!scope) return null;
   const rows = _lampReadForm().filter(r => r.mitra && r.pltu);
   if (!rows.length) return null;
-  return { month: scope.mi, year: scope.year, rows };
+  // V127: `removed` ikut disimpan supaya mitra yang dihapus tidak muncul lagi
+  // ketika laporan ini dibuka kembali dan grid ditarik ulang dari Daftar Kontrak.
+  return { month: scope.mi, year: scope.year, rows, removed: _lampRemovedKeys.slice() };
 }
 window.buildLampiranFromForm = buildLampiranFromForm;
 
@@ -14301,7 +14359,7 @@ function loadLaporanIntoForm(model, id, meta){
   if (lampOn){
     lampOn.checked = !!savedLamp;
     toggleLaporanLampiran();
-    if (savedLamp) renderLaporanLampiran(true, savedLamp);
+    if (savedLamp) renderLaporanLampiran(true, savedLamp, model.lampiran.removed || []);
   }
 
   // rebuild preview from the freshly-populated form + show the editor (no scroll —
