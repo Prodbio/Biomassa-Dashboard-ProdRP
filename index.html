@@ -13191,14 +13191,18 @@ function _exportLaporanPDF(canvas, model){
   if (!JsPDF){ alert('Library PDF belum siap, coba lagi sebentar.'); return; }
   const imgW = canvas.width / 2, imgH = canvas.height / 2; // logical pts
   const pdf = new JsPDF({ orientation: imgH >= imgW ? 'portrait' : 'landscape', unit: 'pt', format: [imgW, imgH] });
-  pdf.addImage(canvas.toDataURL('image/png'), 'PNG', 0, 0, imgW, imgH);
+  // V128: argumen ke-8 `compression` WAJIB diisi. Tanpa itu jsPDF menyimpan PNG
+  // MENTAH tanpa deflate — satu halaman 1800x2200 jadi ~12 MB, dan laporan +
+  // 3 halaman lampiran menembus 60 MB. 'FAST' tetap lossless (deflate biasa),
+  // hasilnya ~1,5 MB. Diukur: 63,4 MB → 1,54 MB, gambar identik.
+  pdf.addImage(canvas.toDataURL('image/png'), 'PNG', 0, 0, imgW, imgH, undefined, 'FAST');
   // V119: halaman Lampiran menyusul di PDF yang sama (satu file, laporan + lampiran).
   // Kanvas dibangun ulang dari `model`, bukan diambil dari DOM, supaya isi PDF
   // selalu sama dengan preview tanpa bergantung container mana yang aktif.
   _lampiranCanvases(model).forEach(lc => {
     const lw = lc.width / 2, lh = lc.height / 2;
     pdf.addPage([lw, lh], lh >= lw ? 'portrait' : 'landscape');
-    pdf.addImage(lc.toDataURL('image/png'), 'PNG', 0, 0, lw, lh);
+    pdf.addImage(lc.toDataURL('image/png'), 'PNG', 0, 0, lw, lh, undefined, 'FAST');
   });
   pdf.save(_laporanFileStamp(model) + '.pdf');
 }
