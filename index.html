@@ -21928,6 +21928,132 @@ function subscribeUpdateDataRealtime(){
     .subscribe();
 }
 
+// =====================================================
+// V129: sinkron ulang saat halaman kembali aktif.
+// Realtime websocket TIDAK bisa diandalkan sendirian: browser membekukan tab
+// yang lama di latar (dan laptop yang tidur memutus koneksi), lalu event yang
+// lewat selama itu hilang selamanya — channel-nya "hidup" tapi datanya basi.
+// Itulah kenapa "Updated per" tertinggal di jam terakhir halaman dibuka.
+// Jadi setiap kali halaman terlihat lagi kita menarik ulang, bukan menunggu.
+// =====================================================
+const liveSync = {
+  busy: false,
+  lastAt: 0,               // ms epoch resync sukses terakhir
+  MIN_GAP_MS: 45 * 1000,   // jangan menembak server lebih rapat dari ini
+  TICK_MS: 3 * 60 * 1000,  // ketukan berkala selama tab terlihat
+  timer: null,
+  started: false,
+};
+
+// Channel Supabase yang mati tidak selalu pulih sendiri. 'joined'/'joining' =
+// sehat; apa pun selain itu (closed/errored/leaving) perlu dipasang ulang.
+function _lsChannelDead(ch){
+  if (!ch) return true;
+  const st = (ch && typeof ch.state === 'string') ? ch.state : '';
+  return st !== 'joined' && st !== 'joining';
+}
+
+// Pengguna yang sedang mengetik di form tidak boleh kehilangan isiannya karena
+// rerenderActiveTab(). Tunda penerapan; ketukan berikutnya akan mencoba lagi.
+function _lsUserIsTyping(){
+  const el = document.activeElement;
+  if (!el) return false;
+  if (el.isContentEditable) return true;
+  const tag = (el.tagName || '').toUpperCase();
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+}
+
+// Hanya cap waktunya yang ditarik (beberapa byte), bukan blob ~900 KB di kolom
+// `data`. Full fetch baru dilakukan bila cap waktunya memang berubah — tanpa ini
+// ketukan tiap 3 menit akan membakar egress untuk data yang identik.
+async function fetchDashboardStamp(){
+  if (!supabaseClient) return null;
+  try {
+    const { data, error } = await supabaseClient
+      .from('dashboard_data').select('uploaded_at').eq('id', 1).single();
+    if (error || !data) return null;
+    return data.uploaded_at || null;
+  } catch(e){ return null; }
+}
+
+// Tarik dashboard_data bila server punya unggahan yang lebih baru dari yang
+// ada di memori. Mengembalikan true bila data baru benar-benar diterapkan.
+async function syncDashboardIfStale(){
+  const stamp = await fetchDashboardStamp();
+  if (!stamp) return false;
+  if (DATA.last_upload_at && stamp === DATA.last_upload_at) return false;
+  if (_lsUserIsTyping()) return false;   // coba lagi pada ketukan berikutnya
+  const row = await loadDashboardDataFromServer();
+  if (!row || !row.data) return false;
+  applyDashboardData(row.data, {
+    uploaded_by: row.uploaded_by,
+    uploaded_at: row.uploaded_at,
+    source_filename: row.source_filename,
+    data_summary: row.data_summary,
+  });
+  return true;
+}
+
+// full=false → ketukan ringan (cek cap waktu dashboard_data saja).
+// full=true  → halaman baru kembali terlihat / online lagi: perbaiki channel
+//              yang putus dan tarik ulang semua sumber sampingan juga.
+async function resyncLiveData(reason, full){
+  if (!supabaseClient || !navigator.onLine) return;
+  if (liveSync.busy) return;
+  if (Date.now() - liveSync.lastAt < liveSync.MIN_GAP_MS) return;
+  liveSync.busy = true;
+  try {
+    if (full){
+      if (_lsChannelDead(updateRealtimeChannel)) subscribeUpdateDataRealtime();
+      if (_lsChannelDead(autoRefreshState.channel)){
+        autoRefreshState.channel = null;
+        subscribeAutoRefreshState();
+      }
+      if (typeof subscribeBottlenecksRealtime === 'function'
+          && typeof bnChannel !== 'undefined' && _lsChannelDead(bnChannel)){
+        subscribeBottlenecksRealtime();
+      }
+    }
+    await syncDashboardIfStale();
+    if (full){
+      // Sumber yang tinggal di tabelnya sendiri (lihat catatan di fetchKontrakPasokan).
+      // Payloadnya kecil dan fetch-nya idempoten, jadi cukup ditarik apa adanya.
+      await Promise.all([
+        (typeof fetchAutoRefreshState === 'function') ? fetchAutoRefreshState().catch(()=>{}) : null,
+        (typeof fetchDoData === 'function') ? fetchDoData().catch(()=>{}) : null,
+        (typeof fetchKontrakPasokan === 'function') ? fetchKontrakPasokan().catch(()=>{}) : null,
+        (_bnSyncInit && typeof fetchBottlenecksFromServer === 'function')
+          ? fetchBottlenecksFromServer().catch(()=>{}) : null,
+      ]);
+    }
+    liveSync.lastAt = Date.now();
+  } catch(e){
+    console.warn('[Sync] resync gagal (' + reason + '):', e);
+  } finally {
+    liveSync.busy = false;
+  }
+}
+window.resyncLiveData = resyncLiveData;
+
+function startLiveSync(){
+  if (liveSync.started) return;
+  liveSync.started = true;
+  liveSync.lastAt = Date.now();   // boot baru saja menarik semuanya
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') resyncLiveData('visible', true);
+  });
+  // Sebagian browser (dan tab yang tidak pernah benar-benar hidden, mis. jendela
+  // lain menutupinya) tidak memancarkan visibilitychange — focus menutup celah itu.
+  window.addEventListener('focus', () => resyncLiveData('focus', true));
+  window.addEventListener('online', () => resyncLiveData('online', true));
+
+  if (liveSync.timer) clearInterval(liveSync.timer);
+  liveSync.timer = setInterval(() => {
+    if (document.visibilityState === 'visible') resyncLiveData('tick', false);
+  }, liveSync.TICK_MS);
+}
+
 // Replace DATA in memory + re-render all visible tabs
 function applyDashboardData(newData, meta){
   if (!newData || typeof newData !== 'object') return;
@@ -26885,6 +27011,10 @@ window.addEventListener('DOMContentLoaded', () => {
     // V107: tanpa Supabase / offline, DATA tetap yang tertanam di HTML — sudah siap.
     if (typeof qolRestoreLastTab === 'function') qolRestoreLastTab();
   }
+  // V129: dipasang tanpa syarat — pendengar 'online' inilah yang menyelamatkan
+  // sesi yang boot dalam keadaan offline; resyncLiveData() sendiri yang menjaga
+  // supabaseClient/navigator.onLine sebelum menembak server.
+  startLiveSync();
 
   // ========= MOBILE SIDEBAR (backdrop) =========
   const mobileBackdrop = document.getElementById('mobileBackdrop');
