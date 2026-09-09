@@ -11593,16 +11593,57 @@ function applyCancelledContracts(){
     if (hit){ c.terminated = true; c.cancelled = true; }
   }
 }
+// V130: nama PLTU pada sebuah kontrak -> objek plant, atau null bila tidak bisa
+// dipastikan. Aturannya sama dengan globalPlantByName()/resolveUsulanPltuName():
+// cocok persis dulu, baru fallback "salah satu memuat yang lain" — dan fallback itu
+// HANYA diterima bila kandidatnya tunggal.
+//
+// Ini menggantikan aturan lama `cp.startsWith(pn) || pn.startsWith(cp)` yang membuat
+// setiap unit ekspansi meminjam kontrak PLTU induknya: "Lontar 4 (Expansion)" tampil
+// membawa 8 kontrak milik "Lontar", "Barru 3 (Expansion)" milik "Barru", "Asam Asam
+// 5-6" milik "Asam Asam" — dan sebaliknya "Nii Tanasa" ikut menarik kontrak "Nii
+// Tanasa 3". Volume yang sama terhitung dua kali di lampiran laporan, panel detail
+// PLTU, dan Sisa Kontrak.
+//
+// Konsekuensi yang disengaja: kontrak berlabel "Paiton" (tanpa nomor unit) cocok ke
+// "Paiton 1-2" DAN "Paiton 9" sekaligus, jadi kini tidak dipetakan ke salah satunya —
+// menebak lebih buruk daripada tidak menebak. Kontrak itu tetap tampil apa adanya di
+// tab Daftar Kontrak; yang hilang hanya penempelannya ke satu PLTU.
+let _cPlantCache = new Map(), _cPlantCacheRef = null;
+function contractPlant(c){
+  const plants = (DATA && DATA.plants) || [];
+  if (_cPlantCacheRef !== plants){ _cPlantCache = new Map(); _cPlantCacheRef = plants; }
+  const key = _gfKey(canonPltuName(c && c.pltu));
+  if (!key) return null;
+  if (_cPlantCache.has(key)) return _cPlantCache.get(key);
+  let out = null;
+  for (const p of plants){
+    if (_gfKey(canonPltuName(p.name)) === key){ out = p; break; }
+  }
+  if (!out){
+    let hit = null, n = 0;
+    for (const p of plants){
+      const k = _gfKey(canonPltuName(p.name));
+      if (!k) continue;
+      if (k.includes(key) || key.includes(k)){ n++; hit = p; if (n > 1) break; }
+    }
+    out = (n === 1) ? hit : null;
+  }
+  _cPlantCache.set(key, out);
+  return out;
+}
+// Identitas objek saja: contractPlant() dan setiap pemanggil matchPlantContracts()
+// sama-sama mengambil plant dari DATA.plants, jadi `===` selalu cukup. Perbandingan
+// lewat `code` sengaja TIDAK dipakai — kolom itu berasal dari Excel dengan fallback
+// 'P###' dan keunikannya tidak dijamin apa pun, jadi ia cuma menambah risiko kontrak
+// nyasar tanpa menambah kecocokan.
+function _samePlant(a, b){ return !!a && a === b; }
 function matchPlantContracts(plant, activeOnly){
   const out = [];
   if (!plant || !DATA || !DATA.contracts) return out;
-  const pn = canonPltuName(plant.name);
-  if (!pn) return out;
   const today = new Date().toISOString().slice(0, 10);
   for (const c of DATA.contracts){
-    const cp = canonPltuName(c.pltu);
-    if (!cp) continue;
-    if (!(cp === pn || cp.startsWith(pn) || pn.startsWith(cp))) continue;
+    if (!_samePlant(contractPlant(c), plant)) continue;
     // Terminated (struck-through) contracts count as expired regardless of akhir.
     if (activeOnly && (c.terminated || (c.akhir && c.akhir < today))) continue;
     out.push(c);
@@ -17536,18 +17577,33 @@ function getFilteredRealisasiForContract(c){
   }
 }
 
+// V130: regional sebuah kontrak yang namanya cocok ke lebih dari satu PLTU —
+// dipakai HANYA bila semua kandidatnya se-regional, selain itu null.
+function _ambiguousContractRegional(c){
+  const key = _gfKey(canonPltuName(c && c.pltu));
+  if (!key) return null;
+  // `seen` terpisah dari nilainya: `regional` kosong adalah nilai yang sah, jadi null
+  // tidak bisa dipakai sekaligus sebagai penanda "belum ada kandidat".
+  let reg = null, seen = false;
+  for (const p of ((DATA && DATA.plants) || [])){
+    const k = _gfKey(canonPltuName(p.name));
+    if (!k) continue;
+    if (!(k.includes(key) || key.includes(k))) continue;
+    const r = p.regional || null;
+    if (!seen){ reg = r; seen = true; }
+    else if (reg !== r) return null;
+  }
+  return reg;
+}
+
 // Macro-region (jawa/sumatera/kalimantan/sulmapana) for a contract, resolved via
 // its PLTU → the matching plant's `regional` → PROVINCE_GROUPS.
 function contractProvince(c){
-  const cp = canonPltuName(c.pltu);
-  if (!cp) return null;
-  const plants = (DATA && DATA.plants) || [];
-  let reg = null;
-  for (const p of plants){
-    const pn = canonPltuName(p.name);
-    if (!pn) continue;
-    if (cp === pn || cp.startsWith(pn) || pn.startsWith(cp)){ reg = p.regional; break; }
-  }
+  const p = contractPlant(c);
+  // V130: pencocokan longgar diganti contractPlant(). Untuk nama yang ambigu
+  // ("Paiton" -> Paiton 1-2 dan Paiton 9) region masih bisa dipakai selama SELURUH
+  // kandidatnya berada di regional yang sama — di sini menebak tidak berisiko.
+  let reg = p ? p.regional : _ambiguousContractRegional(c);
   if (!reg) return null;
   for (const prov in PROVINCE_GROUPS){
     if (PROVINCE_GROUPS[prov].has(reg)) return prov;
